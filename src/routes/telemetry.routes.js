@@ -7,11 +7,16 @@ const { Servers, Sessions, pingLogs } = require("../config/db");
  * per-user session data (see Sessions in tunnel.routes.js /connect and
  * /disconnect).
  *
- * totalMb is still an estimate, not measured bytes — real byte accounting
- * needs the WireGuard edge nodes to report `wg show wg0 transfer` per peer
- * back to this backend, since that's the only place actual tunnel traffic
- * is visible. Sessions/duration/best-server below ARE real, tracked
- * per-user data now, not global placeholders.
+ * totalMb now uses REAL measured bytes: ConnectionContext polls the
+ * native WireGuard stats (getStats()) every ~8s while connected and posts
+ * rxBytes/txBytes to /tunnel/report-stats, which are already stored per
+ * session (see tunnel.routes.js). This just wasn't being summed here —
+ * it fell back to a ~4MB/min guess instead. Sessions that have real byte
+ * counts on file use those; only sessions with no reported bytes yet
+ * (e.g. a very old session from before this fix, or a session that
+ * disconnected before the first stats poll) fall back to the time
+ * estimate, and the response is only flagged as an estimate overall if
+ * that fallback was actually needed anywhere.
  */
 router.get("/data-usage", requireAuth, (req, res) => {
   const mySessions = Sessions.find((s) => s.userId === req.userId);
@@ -43,9 +48,29 @@ router.get("/data-usage", requireAuth, (req, res) => {
   const samples = pingLogs.filter((p) => p.ms != null);
   const avgPingMs = samples.length ? Math.round(samples.reduce((a, s) => a + s.ms, 0) / samples.length) : null;
 
+  // Real bytes: sum whatever each session actually reported. A session
+  // only has rxBytes/txBytes once at least one report-stats call landed
+  // for it — sessions with neither key present (undefined, not just 0)
+  // haven't reported yet, so they fall back to the time estimate instead
+  // of silently counting as 0 bytes used.
+  let measuredBytes = 0;
+  let estimateNeededMinutes = 0;
+  for (const s of mySessions) {
+    const hasRealBytes = s.rxBytes != null || s.txBytes != null;
+    if (hasRealBytes) {
+      measuredBytes += (s.rxBytes || 0) + (s.txBytes || 0);
+    } else {
+      const durationMin = (s.endedAt ? s.endedAt - s.startedAt : Date.now() - s.startedAt) / 60000;
+      estimateNeededMinutes += durationMin;
+    }
+  }
+  const measuredMb = measuredBytes / (1024 * 1024);
+  const estimateMb = estimateNeededMinutes * 4; // ~4MB/min guess, only for sessions with no real report
+  const totalMbIsEstimate = estimateNeededMinutes > 0 && measuredBytes === 0;
+
   res.json({
-    totalMb: Math.round(totalMinutes * 4), // estimate: ~4MB/min tunneled — replace with real wg transfer stats
-    totalMbIsEstimate: true,
+    totalMb: Math.round((measuredMb + estimateMb) * 10) / 10,
+    totalMbIsEstimate,
     sessions: mySessions.length,
     avgSessionMin,
     longestSessionMin,
